@@ -1,0 +1,99 @@
+# Lokal gelistirme: sadece "docker compose up -d" -> Postgres + Redis.
+# Tum yigini konteynerde calistirmak icin:  docker compose --profile full up --build
+#
+# Not: Postgres host portu 5433 (5432 degil) -- baska bir projeyle cakismasin diye.
+
+name: ticketsale
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ticketsale
+      POSTGRES_PASSWORD: ticketsale_dev_pw
+      POSTGRES_DB: ticketsale
+    ports:
+      - "5433:5432"
+    volumes:
+      - ticketsale_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ticketsale -d ticketsale"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - ticketsale_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # --- Asagidakiler sadece "full" profilinde calisir ---
+
+  migrate:
+    profiles: ["full"]
+    build: .
+    entrypoint: ["migrate", "up"]
+    environment:
+      DATABASE_URL: postgres://ticketsale:ticketsale_dev_pw@postgres:5432/ticketsale?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    profiles: ["full"]
+    build: .
+    restart: unless-stopped
+    environment:
+      HTTP_PORT: "8080"
+      DATABASE_URL: postgres://ticketsale:ticketsale_dev_pw@postgres:5432/ticketsale?sslmode=disable
+      REDIS_ADDR: redis:6379
+      JWT_SECRET: dev-only-super-secret-change-in-prod
+      CORS_ORIGIN: http://localhost:8081
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    profiles: ["full"]
+    build: .
+    entrypoint: ["worker"]
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://ticketsale:ticketsale_dev_pw@postgres:5432/ticketsale?sslmode=disable
+      REDIS_ADDR: redis:6379
+      JWT_SECRET: dev-only-super-secret-change-in-prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    profiles: ["full"]
+    build:
+      context: ./web
+      args:
+        VITE_API_URL: http://localhost:8080
+    restart: unless-stopped
+    ports:
+      - "8081:80"
+    depends_on:
+      - api
+
+volumes:
+  ticketsale_pgdata:
+  ticketsale_redisdata:

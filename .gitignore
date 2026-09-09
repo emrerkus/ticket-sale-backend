@@ -1,0 +1,20 @@
+# Ortam degiskenleri (gizli) - .env.example commit'lenir, .env commit'lenmez
+.env
+
+# Derlenmis binary'ler
+/bin/
+/dist/
+*.exe
+
+# Test & coverage ciktilari
+*.out
+coverage.*
+
+# Frontend
+web/node_modules/
+web/dist/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

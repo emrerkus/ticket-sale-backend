@@ -1,0 +1,5 @@
+# Tum metin dosyalari repo'da LF; checkout'ta platforma birakma.
+* text=auto eol=lf
+
+# Windows binary'leri
+*.exe binary
