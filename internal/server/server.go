@@ -14,6 +14,7 @@ import (
 
 	"github.com/emrerkus/ticket-sale-backend/internal/auth"
 	"github.com/emrerkus/ticket-sale-backend/internal/config"
+	"github.com/emrerkus/ticket-sale-backend/internal/eventlog"
 	"github.com/emrerkus/ticket-sale-backend/internal/lock"
 	"github.com/emrerkus/ticket-sale-backend/internal/repository"
 	"github.com/emrerkus/ticket-sale-backend/internal/service"
@@ -37,7 +38,9 @@ type Server struct {
 }
 
 // New bir Server kurar ama HENUZ dinlemeye baslamaz.
-func New(cfg config.Config, log *slog.Logger, db *pgxpool.Pool, rdb *redis.Client) *Server {
+// events: is olaylarini (hold/satin alma/birakma) Grafana Loki'ye ve stdout'a
+// yazan logger (bkz. internal/eventlog, cmd/api/main.go'da kuruluyor).
+func New(cfg config.Config, log *slog.Logger, db *pgxpool.Pool, rdb *redis.Client, events *eventlog.Logger) *Server {
 	// Katman zinciri: pgxpool -> repository -> service -> handler.
 	userRepo := repository.NewUserRepository(db)
 	eventRepo := repository.NewEventRepository(db)
@@ -50,8 +53,8 @@ func New(cfg config.Config, log *slog.Logger, db *pgxpool.Pool, rdb *redis.Clien
 		cfg: cfg, log: log, db: db, rdb: rdb, tokens: tokens,
 		authSvc:  service.NewAuthService(userRepo, tokens),
 		eventSvc: service.NewEventService(eventRepo),
-		holdSvc:  service.NewSeatHoldService(eventRepo, locker),
-		orderSvc: service.NewOrderService(orderRepo),
+		holdSvc:  service.NewSeatHoldService(eventRepo, locker, events),
+		orderSvc: service.NewOrderService(orderRepo, events),
 	}
 
 	// Global middleware zinciri (disdan ice): recoverer -> requestID -> logger -> cors.

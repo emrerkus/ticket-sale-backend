@@ -1,0 +1,14 @@
+# Bu klasordeki (deploy/grafana/dashboards) JSON dosyalarini Grafana acilista
+# otomatik yukler -- elle import etmeye gerek yok.
+apiVersion: 1
+
+providers:
+  - name: ticketsale
+    orgId: 1
+    folder: "TicketSale"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/dashboards

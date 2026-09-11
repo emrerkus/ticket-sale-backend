@@ -1,7 +1,12 @@
-# Lokal gelistirme: sadece "docker compose up -d" -> Postgres + Redis.
+# Lokal gelistirme: sadece "docker compose up -d" -> Postgres + Redis + Loki + Grafana.
 # Tum yigini konteynerde calistirmak icin:  docker compose --profile full up --build
 #
 # Not: Postgres host portu 5433 (5432 degil) -- baska bir projeyle cakismasin diye.
+#
+# Loglama: API ve worker, is olaylarini (koltuk tutuldu/satildi/birakildi) hem
+# stdout'a hem Grafana Loki'ye yazar (bkz. internal/logging, internal/eventlog).
+# Grafana: http://localhost:3000 (kullanici: admin, sifre: admin -- ilk girişte
+# degistirmen istenir). "TicketSale" klasorundeki dashboard otomatik yuklenir.
 
 name: ticketsale
 
@@ -37,6 +42,38 @@ services:
       timeout: 3s
       retries: 10
 
+  loki:
+    image: grafana/loki:3.1.1
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./deploy/loki/local-config.yaml:/etc/loki/local-config.yaml:ro
+      - ticketsale_lokidata:/loki
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3100/ready || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/etc/grafana/dashboards:ro
+      - ticketsale_grafanadata:/var/lib/grafana
+    depends_on:
+      loki:
+        condition: service_healthy
+
   # --- Asagidakiler sadece "full" profilinde calisir ---
 
   migrate:
@@ -59,12 +96,15 @@ services:
       REDIS_ADDR: redis:6379
       JWT_SECRET: dev-only-super-secret-change-in-prod
       CORS_ORIGIN: http://localhost:8081
+      LOKI_URL: http://loki:3100
     ports:
       - "8080:8080"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      loki:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
@@ -78,8 +118,11 @@ services:
       DATABASE_URL: postgres://ticketsale:ticketsale_dev_pw@postgres:5432/ticketsale?sslmode=disable
       REDIS_ADDR: redis:6379
       JWT_SECRET: dev-only-super-secret-change-in-prod
+      LOKI_URL: http://loki:3100
     depends_on:
       postgres:
+        condition: service_healthy
+      loki:
         condition: service_healthy
 
   web:
@@ -97,3 +140,5 @@ services:
 volumes:
   ticketsale_pgdata:
   ticketsale_redisdata:
+  ticketsale_lokidata:
+  ticketsale_grafanadata:

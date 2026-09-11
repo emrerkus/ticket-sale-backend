@@ -26,6 +26,8 @@ type Config struct {
 	JWTSecret  string        // JWT imzalama anahtari (zorunlu)
 	JWTTTL     time.Duration // token gecerlilik suresi
 	CORSOrigin string        // frontend'in adresi (CORS icin), or. "http://localhost:5173"
+
+	LokiURL string // Loki push API adresi, or. "http://localhost:3100". Bos ise Loki'ye log gonderilmez.
 }
 
 // Load ortam degiskenlerini okuyup bir Config uretir.
@@ -38,6 +40,7 @@ func Load() (Config, error) {
 		RedisAddr:   getStr("REDIS_ADDR", "localhost:6379"),
 		JWTSecret:   getStr("JWT_SECRET", ""),
 		CORSOrigin:  getStr("CORS_ORIGIN", "http://localhost:5173"),
+		LokiURL:     getStr("LOKI_URL", "http://localhost:3100"),
 	}
 
 	jwtTTLStr := getStr("JWT_TTL", "24h")

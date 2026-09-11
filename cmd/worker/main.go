@@ -25,8 +25,12 @@ import (
 
 	"github.com/emrerkus/ticket-sale-backend/internal/config"
 	"github.com/emrerkus/ticket-sale-backend/internal/db"
+	"github.com/emrerkus/ticket-sale-backend/internal/eventlog"
+	"github.com/emrerkus/ticket-sale-backend/internal/logging"
 	"github.com/emrerkus/ticket-sale-backend/internal/repository"
 )
+
+const serviceName = "ticketsale-worker"
 
 // Ne siklikla tarayalim?
 //
@@ -51,6 +55,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// API'deki ile ayni: stdout + Grafana Loki'ye yazan logger.
+	log = slog.New(logging.NewMultiHandler(
+		slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}),
+		logging.NewLokiHandler(ctx, cfg.LokiURL, serviceName),
+	))
+	events := eventlog.New(log)
+
 	pool, err := db.Connect(ctx, cfg.DatabaseURL)
 	if err != nil {
 		log.Error("DB baglanamadi", "err", err)
@@ -64,7 +75,7 @@ func main() {
 
 	// Baslar baslamaz bir kez calistir, sonra periyodik. (Uygulama uzun sure
 	// kapali kaldiysa birikmis hold'lari/siparisleri beklemeden temizle.)
-	sweep(ctx, log, eventRepo, orderRepo)
+	sweep(ctx, log, events, eventRepo, orderRepo)
 
 	// time.Ticker: her sweepInterval'da bir kanala ("ticker.C") deger yollar.
 	// cmd/api'deki server.Run'daki select kalibinin aynisi.
@@ -77,7 +88,7 @@ func main() {
 			log.Info("worker kapaniyor")
 			return
 		case <-ticker.C:
-			sweep(ctx, log, eventRepo, orderRepo)
+			sweep(ctx, log, events, eventRepo, orderRepo)
 		}
 	}
 }
@@ -85,20 +96,31 @@ func main() {
 // sweep bir tarama turu: (1) suresi gecmis siparisleri iptal et ve koltuklarini
 // birak, (2) siparise bagli olmayan suresi gecmis hold'lari birak.
 // Sira onemli: once siparisler (koltuklari o birakir), sonra kalan hold'lar.
-func sweep(ctx context.Context, log *slog.Logger, eventRepo *repository.EventRepository, orderRepo *repository.OrderRepository) {
-	if n, err := orderRepo.ExpireOrders(ctx); err != nil {
+// Her serbest kalan koltuk icin ayri bir "seat_released" olayi loglanir --
+// Grafana'da "kim, hangi koltugu, neden birakti" sorusuna cevap verir.
+func sweep(ctx context.Context, log *slog.Logger, events *eventlog.Logger, eventRepo *repository.EventRepository, orderRepo *repository.OrderRepository) {
+	if expired, err := orderRepo.ExpireOrders(ctx); err != nil {
 		if ctx.Err() == nil {
 			log.Error("suresi gecen siparisler temizlenemedi", "err", err)
 		}
-	} else if n > 0 {
-		log.Info("suresi gecen siparisler iptal edildi", "adet", n)
+	} else if len(expired) > 0 {
+		log.Info("suresi gecen siparisler iptal edildi", "adet", len(expired))
+		for _, o := range expired {
+			events.OrderExpired(ctx, o.OrderID, o.UserID, len(o.Seats))
+			for _, seat := range o.Seats {
+				events.SeatReleased(ctx, seat.EventID, seat.SeatID, seat.UserID, eventlog.ReasonOrderExpired)
+			}
+		}
 	}
 
-	if n, err := eventRepo.ExpireHolds(ctx); err != nil {
+	if expired, err := eventRepo.ExpireHolds(ctx); err != nil {
 		if ctx.Err() == nil {
 			log.Error("suresi gecen hold'lar temizlenemedi", "err", err)
 		}
-	} else if n > 0 {
-		log.Info("suresi gecen hold'lar serbest birakildi", "adet", n)
+	} else if len(expired) > 0 {
+		log.Info("suresi gecen hold'lar serbest birakildi", "adet", len(expired))
+		for _, h := range expired {
+			events.SeatReleased(ctx, h.EventID, h.SeatID, h.UserID, eventlog.ReasonHoldExpired)
+		}
 	}
 }

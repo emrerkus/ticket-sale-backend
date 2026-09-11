@@ -162,12 +162,21 @@ func (r *OrderRepository) Checkout(
 	return orderID, nil
 }
 
+// PurchasedSeat: basariyla satilan bir koltugun, loglama icin gereken bilgisi.
+type PurchasedSeat struct {
+	EventID        string
+	SeatID         string
+	UnitPriceCents int64
+}
+
 // Pay bir siparisi oder (mock saglayici). fail=true ise odeme reddedilir.
 // Basarili odemede: koltuklar 'sold', siparis 'paid'. Hepsi tek transaction.
-func (r *OrderRepository) Pay(ctx context.Context, orderID, userID string, fail bool) (domain.Payment, error) {
+// Ikinci donus degeri SADECE basarili odemede doldurulur -- hangi koltuklarin
+// (event_id, seat_id) satildigi, cagiran tarafin bunlari loglayabilmesi icin.
+func (r *OrderRepository) Pay(ctx context.Context, orderID, userID string, fail bool) (domain.Payment, []PurchasedSeat, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
-		return domain.Payment{}, fmt.Errorf("tx: %w", err)
+		return domain.Payment{}, nil, fmt.Errorf("tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
@@ -181,13 +190,13 @@ func (r *OrderRepository) Pay(ctx context.Context, orderID, userID string, fail 
 		orderID, userID,
 	).Scan(&status, &total, &currency, &expiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return domain.Payment{}, ErrNotFound
+		return domain.Payment{}, nil, ErrNotFound
 	}
 	if err != nil {
-		return domain.Payment{}, fmt.Errorf("siparis kilitlenemedi: %w", err)
+		return domain.Payment{}, nil, fmt.Errorf("siparis kilitlenemedi: %w", err)
 	}
 	if status != "pending" || time.Now().After(expiresAt) {
-		return domain.Payment{}, ErrOrderNotPayable
+		return domain.Payment{}, nil, ErrOrderNotPayable
 	}
 
 	// Odeme kaydini olustur (pending).
@@ -199,7 +208,7 @@ func (r *OrderRepository) Pay(ctx context.Context, orderID, userID string, fail 
 		orderID, total, currency,
 	).Scan(&paymentID)
 	if err != nil {
-		return domain.Payment{}, fmt.Errorf("odeme kaydi: %w", err)
+		return domain.Payment{}, nil, fmt.Errorf("odeme kaydi: %w", err)
 	}
 
 	providerRef := "mock_" + paymentID[:8]
@@ -209,63 +218,76 @@ func (r *OrderRepository) Pay(ctx context.Context, orderID, userID string, fail 
 			`UPDATE payments SET status = 'failed', provider_ref = $2, updated_at = now() WHERE id = $1`,
 			paymentID, providerRef,
 		); err != nil {
-			return domain.Payment{}, fmt.Errorf("odeme guncellenemedi: %w", err)
+			return domain.Payment{}, nil, fmt.Errorf("odeme guncellenemedi: %w", err)
 		}
 		if err := tx.Commit(ctx); err != nil {
-			return domain.Payment{}, fmt.Errorf("commit: %w", err)
+			return domain.Payment{}, nil, fmt.Errorf("commit: %w", err)
 		}
-		return r.getPayment(ctx, paymentID)
+		p, err := r.getPayment(ctx, paymentID)
+		return p, nil, err
 	}
 
-	// Basarili odeme: her koltugu 'sold'a cevir (held + benimse).
-	rows, err := tx.Query(ctx, `SELECT event_seat_id FROM order_items WHERE order_id = $1`, orderID)
+	// Basarili odeme: her koltugu 'sold'a cevir (held + benimse). event_id/seat_id'yi
+	// de ceker (yalnizca event_seat_id degil) -- loglama bunlari kullanacak.
+	rows, err := tx.Query(ctx, `
+		SELECT es.id, es.event_id, es.seat_id, oi.unit_price_cents
+		FROM order_items oi
+		JOIN event_seats es ON es.id = oi.event_seat_id
+		WHERE oi.order_id = $1`, orderID)
 	if err != nil {
-		return domain.Payment{}, fmt.Errorf("kalemler okunamadi: %w", err)
+		return domain.Payment{}, nil, fmt.Errorf("kalemler okunamadi: %w", err)
 	}
-	var eventSeatIDs []string
+	type line struct {
+		eventSeatID string
+		seat        PurchasedSeat
+	}
+	var lines []line
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var l line
+		if err := rows.Scan(&l.eventSeatID, &l.seat.EventID, &l.seat.SeatID, &l.seat.UnitPriceCents); err != nil {
 			rows.Close()
-			return domain.Payment{}, err
+			return domain.Payment{}, nil, err
 		}
-		eventSeatIDs = append(eventSeatIDs, id)
+		lines = append(lines, l)
 	}
 	rows.Close()
 
-	for _, esID := range eventSeatIDs {
+	purchased := make([]PurchasedSeat, 0, len(lines))
+	for _, l := range lines {
 		tag, err := tx.Exec(ctx, `
 			UPDATE event_seats
 			SET status = 'sold', held_until = NULL, held_by = NULL, version = version + 1, updated_at = now()
 			WHERE id = $1 AND status = 'held' AND held_by = $2`,
-			esID, userID,
+			l.eventSeatID, userID,
 		)
 		if err != nil {
-			return domain.Payment{}, fmt.Errorf("koltuk sold yapilamadi: %w", err)
+			return domain.Payment{}, nil, fmt.Errorf("koltuk sold yapilamadi: %w", err)
 		}
 		if tag.RowsAffected() != 1 {
 			// Koltuk artik bende degil (hold suresi dolmus + baskasi kapmis).
 			// Tum transaction geri sarilir -> odeme de gerceklesmez.
-			return domain.Payment{}, ErrSeatLost
+			return domain.Payment{}, nil, ErrSeatLost
 		}
+		purchased = append(purchased, l.seat)
 	}
 
 	if _, err := tx.Exec(ctx,
 		`UPDATE orders SET status = 'paid', updated_at = now() WHERE id = $1`, orderID,
 	); err != nil {
-		return domain.Payment{}, fmt.Errorf("siparis paid yapilamadi: %w", err)
+		return domain.Payment{}, nil, fmt.Errorf("siparis paid yapilamadi: %w", err)
 	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE payments SET status = 'succeeded', provider_ref = $2, updated_at = now() WHERE id = $1`,
 		paymentID, providerRef,
 	); err != nil {
-		return domain.Payment{}, fmt.Errorf("odeme guncellenemedi: %w", err)
+		return domain.Payment{}, nil, fmt.Errorf("odeme guncellenemedi: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return domain.Payment{}, fmt.Errorf("commit: %w", err)
+		return domain.Payment{}, nil, fmt.Errorf("commit: %w", err)
 	}
-	return r.getPayment(ctx, paymentID)
+	p, err := r.getPayment(ctx, paymentID)
+	return p, purchased, err
 }
 
 func (r *OrderRepository) getPayment(ctx context.Context, id string) (domain.Payment, error) {
@@ -351,35 +373,70 @@ func (r *OrderRepository) ListByUser(ctx context.Context, userID string) ([]doma
 	return out, rows.Err()
 }
 
+// ExpiredOrder: suresi dolup iptal edilen bir siparisin, loglama icin gereken bilgisi.
+type ExpiredOrder struct {
+	OrderID string
+	UserID  string
+	Seats   []ExpiredHold // bu siparisle birakilan koltuklar (ExpiredHold, event.go'da tanimli)
+}
+
 // ExpireOrders suresi gecmis 'pending' siparisleri 'expired' yapar ve
 // tuttuklari koltuklari geri birakir. cmd/worker periyodik cagirir.
-// Etkilenen siparis sayisini doner.
-func (r *OrderRepository) ExpireOrders(ctx context.Context) (int64, error) {
+func (r *OrderRepository) ExpireOrders(ctx context.Context) ([]ExpiredOrder, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("tx: %w", err)
+		return nil, fmt.Errorf("tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
 	rows, err := tx.Query(ctx, `
-		SELECT id FROM orders
+		SELECT id, user_id FROM orders
 		WHERE status = 'pending' AND expires_at < now()
 		FOR UPDATE SKIP LOCKED`)
 	if err != nil {
-		return 0, fmt.Errorf("suresi gecen siparisler: %w", err)
+		return nil, fmt.Errorf("suresi gecen siparisler: %w", err)
 	}
+	byOrder := map[string]*ExpiredOrder{}
 	var ids []string
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var id, userID string
+		if err := rows.Scan(&id, &userID); err != nil {
 			rows.Close()
-			return 0, err
+			return nil, err
 		}
 		ids = append(ids, id)
+		byOrder[id] = &ExpiredOrder{OrderID: id, UserID: userID}
 	}
 	rows.Close()
 	if len(ids) == 0 {
-		return 0, nil
+		return nil, nil
+	}
+
+	// Loglama icin: bu siparislerin hangi koltuklari tuttugunu (event_id, seat_id)
+	// koltuklari birakmadan ONCE oku.
+	seatRows, err := tx.Query(ctx, `
+		SELECT oi.order_id, es.event_id, es.seat_id
+		FROM order_items oi
+		JOIN event_seats es ON es.id = oi.event_seat_id
+		WHERE oi.order_id = ANY($1) AND es.status = 'held'`, ids)
+	if err != nil {
+		return nil, fmt.Errorf("siparis koltuklari okunamadi: %w", err)
+	}
+	for seatRows.Next() {
+		var orderID string
+		var h ExpiredHold
+		if err := seatRows.Scan(&orderID, &h.EventID, &h.SeatID); err != nil {
+			seatRows.Close()
+			return nil, err
+		}
+		if o, ok := byOrder[orderID]; ok {
+			h.UserID = o.UserID
+			o.Seats = append(o.Seats, h)
+		}
+	}
+	seatRows.Close()
+	if err := seatRows.Err(); err != nil {
+		return nil, err
 	}
 
 	// Koltuklari geri birak (sadece hala held olanlar).
@@ -390,17 +447,22 @@ func (r *OrderRepository) ExpireOrders(ctx context.Context) (int64, error) {
 			SELECT event_seat_id FROM order_items WHERE order_id = ANY($1)
 		)`, ids,
 	); err != nil {
-		return 0, fmt.Errorf("koltuklar birakilamadi: %w", err)
+		return nil, fmt.Errorf("koltuklar birakilamadi: %w", err)
 	}
 
-	tag, err := tx.Exec(ctx,
-		`UPDATE orders SET status = 'expired', updated_at = now() WHERE id = ANY($1)`, ids)
-	if err != nil {
-		return 0, fmt.Errorf("siparisler expired yapilamadi: %w", err)
+	if _, err := tx.Exec(ctx,
+		`UPDATE orders SET status = 'expired', updated_at = now() WHERE id = ANY($1)`, ids,
+	); err != nil {
+		return nil, fmt.Errorf("siparisler expired yapilamadi: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("commit: %w", err)
+		return nil, fmt.Errorf("commit: %w", err)
 	}
-	return tag.RowsAffected(), nil
+
+	out := make([]ExpiredOrder, 0, len(byOrder))
+	for _, o := range byOrder {
+		out = append(out, *o)
+	}
+	return out, nil
 }

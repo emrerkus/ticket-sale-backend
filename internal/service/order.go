@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/emrerkus/ticket-sale-backend/internal/domain"
+	"github.com/emrerkus/ticket-sale-backend/internal/eventlog"
 	"github.com/emrerkus/ticket-sale-backend/internal/repository"
 )
 
@@ -29,10 +30,11 @@ var (
 
 type OrderService struct {
 	orders *repository.OrderRepository
+	events *eventlog.Logger
 }
 
-func NewOrderService(orders *repository.OrderRepository) *OrderService {
-	return &OrderService{orders: orders}
+func NewOrderService(orders *repository.OrderRepository, events *eventlog.Logger) *OrderService {
+	return &OrderService{orders: orders, events: events}
 }
 
 // Checkout tutulan koltuklardan bir 'pending' siparis olusturur.
@@ -101,11 +103,18 @@ func (s *OrderService) Pay(ctx context.Context, userID, orderID string, fail boo
 		return nil, ErrInvalidID
 	}
 
-	p, err := s.orders.Pay(ctx, orderID, userID, fail)
+	p, purchased, err := s.orders.Pay(ctx, orderID, userID, fail)
 	switch {
 	case err == nil:
 		// Odeme basariliysa koltuklar artik 'sold'. Redis hold anahtarlari
 		// TTL ile kendiliginden silinecegi icin ekstra temizlik gerekmiyor.
+		if p.Status == "succeeded" {
+			for _, seat := range purchased {
+				s.events.SeatPurchased(ctx, seat.EventID, seat.SeatID, userID, orderID, seat.UnitPriceCents, p.Currency)
+			}
+		} else {
+			s.events.PaymentFailed(ctx, orderID, userID, p.AmountCents, p.Currency)
+		}
 		return &p, nil
 	case errors.Is(err, repository.ErrNotFound):
 		return nil, ErrNotFound

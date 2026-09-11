@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/emrerkus/ticket-sale-backend/internal/domain"
+	"github.com/emrerkus/ticket-sale-backend/internal/eventlog"
 	"github.com/emrerkus/ticket-sale-backend/internal/lock"
 	"github.com/emrerkus/ticket-sale-backend/internal/repository"
 )
@@ -26,10 +27,11 @@ var ErrSeatUnavailable = errors.New("service: koltuk musait degil")
 type SeatHoldService struct {
 	repo   *repository.EventRepository
 	locker *lock.Locker
+	events *eventlog.Logger
 }
 
-func NewSeatHoldService(repo *repository.EventRepository, locker *lock.Locker) *SeatHoldService {
-	return &SeatHoldService{repo: repo, locker: locker}
+func NewSeatHoldService(repo *repository.EventRepository, locker *lock.Locker, events *eventlog.Logger) *SeatHoldService {
+	return &SeatHoldService{repo: repo, locker: locker, events: events}
 }
 
 // lockKey: Redis'teki kilit anahtari. event_id+seat_id kombinasyonu,
@@ -81,6 +83,8 @@ func (s *SeatHoldService) HoldSeat(ctx context.Context, eventID, seatID, holderI
 		return nil, ErrSeatUnavailable
 	}
 
+	s.events.SeatHeld(ctx, eventID, seatID, holderID, heldUntil)
+
 	return &domain.SeatHold{
 		EventID:   eventID,
 		SeatID:    seatID,
@@ -111,5 +115,6 @@ func (s *SeatHoldService) ReleaseSeat(ctx context.Context, eventID, seatID, hold
 
 	// Postgres sahipligi dogruladi -> Redis kilidini de temizle (best-effort).
 	_ = s.locker.ForceRelease(ctx, lockKey(eventID, seatID))
+	s.events.SeatReleased(ctx, eventID, seatID, holderID, eventlog.ReasonUser)
 	return nil
 }

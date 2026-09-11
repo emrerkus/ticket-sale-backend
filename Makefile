@@ -2,12 +2,12 @@
 # Windows'ta `make` yoksa: `choco install make` veya WSL/Git-Bash icindeki make.
 # Alternatif olarak her hedefin altindaki komutu elle de calistirabilirsin.
 
-.PHONY: help up down logs run worker web build test test-e2e tidy fmt vet migrate-up migrate-down migrate-version seed psql full
+.PHONY: help up down logs run worker web build test test-e2e tidy fmt vet migrate-up migrate-down migrate-version seed psql full grafana
 
 help: ## Bu listeyi goster
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 
-up: ## Postgres + Redis'i baslat (arka planda)
+up: ## Postgres + Redis + Loki + Grafana'yi baslat (arka planda)
 	docker compose up -d
 
 down: ## Altyapiyi durdur
@@ -42,6 +42,9 @@ seed: ## Ornek veri yukle (katalogu temizleyip bastan yazar)
 
 psql: ## Postgres'e psql kabugu ac
 	docker compose exec postgres psql -U ticketsale -d ticketsale
+
+grafana: ## Grafana'yi tarayicida ac (admin/admin)
+	@echo "http://localhost:3000  (admin / admin)"
 
 build: ## Binary uret -> bin/api
 	go build -o bin/api ./cmd/api

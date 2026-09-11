@@ -211,18 +211,48 @@ func (r *EventRepository) ReleaseHold(ctx context.Context, eventID, seatID, hold
 	return tag.RowsAffected() == 1, nil
 }
 
+// ExpiredHold: serbest birakilan bir hold'un, loglama icin gereken bilgisi.
+type ExpiredHold struct {
+	EventID string
+	SeatID  string
+	UserID  string // held_by -- guncellemeden ONCEKI deger
+}
+
 // ExpireHolds: suresi gecmis TUM hold'lari serbest birakir. cmd/worker
 // periyodik cagirir. Redis'e DOKUNMAZ -- Redis anahtarlari TTL ile
 // kendiliginden silinir; bu yalnizca Postgres tarafindaki takili kalmis
-// 'held' satirlarini duzeltir. Etkilenen satir sayisini doner.
-func (r *EventRepository) ExpireHolds(ctx context.Context) (int64, error) {
-	tag, err := r.db.Exec(ctx, `
-		UPDATE event_seats
+// 'held' satirlarini duzeltir.
+//
+// WITH ... UPDATE ... FROM deseni: once "expired" CTE'siyle etkilenecek
+// satirlarin ESKI halini (ozellikle held_by, UPDATE bunu NULL'a cevirmeden
+// once) yakalariz, sonra ayni sorguda guncelleriz. Tek atomik ifade -- araya
+// baska bir istek giremez.
+func (r *EventRepository) ExpireHolds(ctx context.Context) ([]ExpiredHold, error) {
+	rows, err := r.db.Query(ctx, `
+		WITH expired AS (
+			SELECT id, event_id, seat_id, held_by
+			FROM event_seats
+			WHERE status = 'held' AND held_until < now()
+			FOR UPDATE
+		)
+		UPDATE event_seats es
 		SET status = 'available', held_until = NULL, held_by = NULL,
 		    version = version + 1, updated_at = now()
-		WHERE status = 'held' AND held_until < now()`)
+		FROM expired
+		WHERE es.id = expired.id
+		RETURNING expired.event_id, expired.seat_id, expired.held_by`)
 	if err != nil {
-		return 0, fmt.Errorf("suresi gecen hold'lar temizlenemedi: %w", err)
+		return nil, fmt.Errorf("suresi gecen hold'lar temizlenemedi: %w", err)
 	}
-	return tag.RowsAffected(), nil
+	defer rows.Close()
+
+	var out []ExpiredHold
+	for rows.Next() {
+		var h ExpiredHold
+		if err := rows.Scan(&h.EventID, &h.SeatID, &h.UserID); err != nil {
+			return nil, fmt.Errorf("hold satiri okunamadi: %w", err)
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
 }

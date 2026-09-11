@@ -19,9 +19,14 @@ import (
 	"github.com/emrerkus/ticket-sale-backend/internal/cache"
 	"github.com/emrerkus/ticket-sale-backend/internal/config"
 	"github.com/emrerkus/ticket-sale-backend/internal/db"
+	"github.com/emrerkus/ticket-sale-backend/internal/eventlog"
+	"github.com/emrerkus/ticket-sale-backend/internal/logging"
 	"github.com/emrerkus/ticket-sale-backend/internal/server"
 	"github.com/joho/godotenv"
 )
+
+// serviceName: Grafana Loki'de bu servisin loglarini "service" etiketiyle ayirt eder.
+const serviceName = "ticketsale-api"
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -39,6 +44,16 @@ func main() {
 	// signal.NotifyContext: SIGINT (Ctrl+C) / SIGTERM gelince ctx iptal olur.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// --- Loglama: hem stdout'a (terminal/docker logs) HEM Grafana Loki'ye ---
+	// MultiHandler ayni kaydi ikisine de yollar. Loki'ye ulasilamasa bile
+	// (henuz ayaga kalkmadi, kapali vs.) uygulama normal calismaya devam eder --
+	// LokiHandler asenkron ve non-blocking'tir (bkz. internal/logging/loki.go).
+	log = slog.New(logging.NewMultiHandler(
+		slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}),
+		logging.NewLokiHandler(ctx, cfg.LokiURL, serviceName),
+	))
+	events := eventlog.New(log)
 
 	// --- Bagimliliklar: Postgres havuzu + Redis client ---
 	// Baglanamadigimiz an burada duruyoruz ("fail fast"): yarim calisan bir
@@ -59,7 +74,7 @@ func main() {
 
 	log.Info("bagimliliklar hazir", "postgres", "ok", "redis", "ok")
 
-	srv := server.New(cfg, log, pool, rdb)
+	srv := server.New(cfg, log, pool, rdb, events)
 	if err := srv.Run(ctx); err != nil {
 		log.Error("sunucu hatayla durdu", "err", err)
 		os.Exit(1)
